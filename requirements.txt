@@ -1,3 +1,4 @@
 discord.py>=2.4
 python-dotenv
 tzdata
+python-telegram-bot>=21
