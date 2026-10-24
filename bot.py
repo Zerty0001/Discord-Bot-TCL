@@ -1279,13 +1279,18 @@ async def main_async() -> None:
     threading.Thread(target=_run_web, daemon=True).start()
 
     if os.environ.get("TELEGRAM_TOKEN"):
-        tg_app = build_tg_app()
-        await tg_app.initialize()
-        await tg_app.bot.set_my_commands(TG_COMMANDS)
-        await tg_initialize_baseline()
-        await tg_app.start()
-        await tg_app.updater.start_polling()
-        log.info("Bot Telegram démarré")
+        try:
+            tg_app = build_tg_app()
+            await tg_app.initialize()
+            await tg_app.bot.set_my_commands(TG_COMMANDS)
+            await tg_initialize_baseline()
+            await tg_app.start()
+            await tg_app.updater.start_polling()
+            log.info("Bot Telegram démarré")
+        except Exception:
+            # ex: token invalide -> on désactive Telegram mais Discord démarre quand même
+            log.exception("Telegram désactivé (Discord démarre quand même)")
+            tg_app = None
 
     try:
         await bot.start(DISCORD_TOKEN)
