@@ -983,8 +983,9 @@ async def _tg_create_storage_message(bot, payload: str) -> None:
     try:
         await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
     except TelegramError:
-        log.exception("Épinglage impossible : le bot doit avoir le droit « Épingler des messages » "
-                      "(sinon les abonnements ne seront pas restaurés au prochain démarrage)")
+        log.exception("Épinglage impossible : le bot doit pouvoir épingler (canal : droit « Modifier les "
+                      "messages des autres » ; groupe : « Épingler des messages ») — sinon les abonnements "
+                      "ne seront pas restaurés au prochain démarrage")
     _tg_storage_msg_id = msg.message_id
     _tg_pushed = payload
 
@@ -1111,6 +1112,59 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await tg_send(context.bot, update.effective_chat.id, MENU_TEXT, _main_markup())
+
+
+async def cmd_stockage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostic du stockage des abonnements (commande cachée : /stockage)."""
+    chat_id = update.effective_chat.id
+    bot_ = context.bot
+    cid = _storage_chat()
+    lignes = ["🗄️ **Stockage des abonnements**"]
+
+    if cid is None:
+        lignes.append("❌ `TELEGRAM_STORAGE_CHAT_ID` est absent ou vide dans les variables d'environnement.")
+        await tg_send(bot_, chat_id, "\n".join(lignes))
+        return
+    lignes.append("✅ Variable `TELEGRAM_STORAGE_CHAT_ID` définie")
+
+    try:
+        chat = await bot_.get_chat(cid)
+    except TelegramError as error:
+        lignes.append(f"❌ Chat introuvable ou inaccessible : {error}")
+        lignes.append("Vérifie l'id (il commence par -100 pour un canal) et que le bot est administrateur.")
+        await tg_send(bot_, chat_id, "\n".join(lignes))
+        return
+    lignes.append(f"✅ Chat trouvé : {chat.title or chat.type} ({chat.type})")
+
+    manque = []
+    try:
+        member = await bot_.get_chat_member(cid, bot_.id)
+        if member.status not in ("administrator", "creator"):
+            lignes.append(f"❌ Le bot n'est pas administrateur (statut : {member.status})")
+        else:
+            lignes.append("✅ Le bot est administrateur")
+            if chat.type == "channel":
+                if getattr(member, "can_post_messages", True) is False:
+                    manque.append("Publier des messages")
+                if getattr(member, "can_edit_messages", True) is False:
+                    manque.append("Modifier les messages des autres (nécessaire pour épingler)")
+            elif getattr(member, "can_pin_messages", True) is False:
+                manque.append("Épingler des messages")
+            if manque:
+                lignes.append("❌ Droit(s) manquant(s) : " + " ; ".join(manque))
+            else:
+                lignes.append("✅ Droits suffisants")
+    except TelegramError as error:
+        lignes.append(f"❌ Droits du bot illisibles : {error}")
+
+    data = _parse_storage(chat.pinned_message.text) if chat.pinned_message and chat.pinned_message.text else None
+    if data is None:
+        lignes.append("⚠️ Aucun message de stockage épinglé pour l'instant (créé au prochain démarrage du bot)")
+    else:
+        lignes.append(f"✅ Message de stockage épinglé trouvé ({len(data.get('subs', {}))} chat(s) abonné(s))")
+    lignes.append("✅ Persistance active" if _tg_storage_msg_id is not None
+                  else "❌ Persistance inactive dans ce processus (voir les logs de démarrage)")
+    await tg_send(bot_, chat_id, "\n".join(lignes))
 
 
 async def send_traffic(context, chat_id: int, lignes: set[str], single: str | None = None):
@@ -1531,6 +1585,7 @@ def build_tg_app() -> Application:
     app.add_handler(CommandHandler("sub", cmd_sub))
     app.add_handler(CommandHandler("lines", cmd_lines))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("stockage", cmd_stockage))
     app.add_handler(CallbackQueryHandler(on_button))
     return app
 
