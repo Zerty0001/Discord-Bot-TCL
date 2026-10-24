@@ -900,6 +900,9 @@ async def test_last_alert(interaction: discord.Interaction):
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("telegram")
+# httpx écrit l'URL complète des requêtes Telegram (donc le token) en INFO : on le coupe
+for _name in ("httpx", "httpcore"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 TG_STATE_FILE = Path("telegram_state.json")  # distinct de state.json (Discord)
 TG_MAX_LEN = 3500  # < 4096 (limite Telegram), marge pour le balisage HTML
@@ -916,6 +919,7 @@ def tg_load_state() -> dict:
 
 def tg_save_state(state: dict) -> None:
     TG_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    _tg_mark_dirty(state)
 
 
 def get_subs(chat_id: int) -> list[str]:
@@ -931,6 +935,117 @@ def set_subs(chat_id: int, lines: list[str]) -> None:
     else:
         subs.pop(str(chat_id), None)
     tg_save_state(state)
+
+
+# ---------- Persistance des abonnements : message épinglé dans un chat Telegram privé ----------
+# Render gratuit efface les fichiers à chaque redéploiement. Les abonnements sont donc aussi
+# recopiés dans UN message épinglé d'un chat (canal privé) dont l'id est dans
+# TELEGRAM_STORAGE_CHAT_ID ; au démarrage le bot le relit et restaure tout.
+# Sans cette variable, les abonnements restent dans le fichier local (non persistants sur Render).
+
+_tg_storage_msg_id: int | None = None
+_tg_pushed: str | None = None  # dernier contenu envoyé dans le message de stockage
+_tg_dirty = asyncio.Event()
+
+
+def _storage_chat():
+    raw = os.environ.get("TELEGRAM_STORAGE_CHAT_ID", "").strip()
+    if not raw:
+        return None
+    return int(raw) if raw.lstrip("-").isdigit() else raw
+
+
+def _subs_payload(state: dict) -> str:
+    return json.dumps(
+        {"v": 1, "subs": state.get("subs", {})},
+        ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    )
+
+
+def _parse_storage(text: str) -> dict | None:
+    """Contenu du message épinglé -> dict, ou None si ce n'est pas notre message de stockage."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) and data.get("v") == 1 and "subs" in data else None
+
+
+def _tg_mark_dirty(state: dict) -> None:
+    if _tg_storage_msg_id is not None and _subs_payload(state) != _tg_pushed:
+        _tg_dirty.set()
+
+
+async def _tg_create_storage_message(bot, payload: str) -> None:
+    global _tg_storage_msg_id, _tg_pushed
+    chat_id = _storage_chat()
+    msg = await bot.send_message(chat_id, payload)
+    try:
+        await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
+    except TelegramError:
+        log.exception("Épinglage impossible : le bot doit avoir le droit « Épingler des messages » "
+                      "(sinon les abonnements ne seront pas restaurés au prochain démarrage)")
+    _tg_storage_msg_id = msg.message_id
+    _tg_pushed = payload
+
+
+async def tg_pull_subs(bot) -> None:
+    """Au démarrage : restaure les abonnements depuis le message épinglé (ou le crée)."""
+    global _tg_storage_msg_id, _tg_pushed
+    chat_id = _storage_chat()
+    if chat_id is None:
+        log.warning("TELEGRAM_STORAGE_CHAT_ID absent : abonnements perdus à chaque redéploiement")
+        return
+    try:
+        chat = await bot.get_chat(chat_id)
+        pinned = chat.pinned_message
+        data = _parse_storage(pinned.text) if pinned is not None and pinned.text else None
+        if data is not None:
+            _tg_storage_msg_id = pinned.message_id
+            _tg_pushed = pinned.text
+            state = tg_load_state()
+            state["subs"] = data.get("subs", {})
+            tg_save_state(state)
+            log.info("Abonnements restaurés : %d chat(s)", len(state["subs"]))
+        else:
+            await _tg_create_storage_message(bot, _subs_payload(tg_load_state()))
+            log.info("Message de stockage créé et épinglé")
+    except Exception:
+        log.exception("Stockage Telegram indisponible : abonnements non persistants")
+        _tg_storage_msg_id = None
+
+
+async def tg_storage_worker(bot) -> None:
+    """Recopie les abonnements dans le message épinglé dès qu'ils changent."""
+    global _tg_pushed
+    while True:
+        await _tg_dirty.wait()
+        await asyncio.sleep(1)  # regroupe les modifications rapprochées
+        _tg_dirty.clear()
+        if _tg_storage_msg_id is None:
+            continue
+        payload = _subs_payload(tg_load_state())
+        if payload == _tg_pushed:
+            continue
+        if len(payload) > 4000:
+            log.error("Abonnements trop volumineux pour un message Telegram (%d car.)", len(payload))
+            continue
+        try:
+            try:
+                await bot.edit_message_text(payload, chat_id=_storage_chat(), message_id=_tg_storage_msg_id)
+                _tg_pushed = payload
+            except BadRequest as error:
+                low = str(error).lower()
+                if "not modified" in low:
+                    _tg_pushed = payload
+                elif "not found" in low:
+                    await _tg_create_storage_message(bot, payload)
+                else:
+                    raise
+        except Exception:
+            log.exception("Sauvegarde des abonnements échouée, nouvel essai dans 30 s")
+            await asyncio.sleep(30)
+            _tg_dirty.set()
 
 
 # ---------- Envoi : conversion Discord (**gras**) -> HTML Telegram ----------
@@ -980,6 +1095,7 @@ def sub_button(chat_id: int, ligne: str) -> InlineKeyboardMarkup:
 
 HELP_TEXT = (
     "🚇 **TCL Info Trafic**\n\n"
+    "/menu — menu à boutons (le plus simple)\n"
     "/traffic `C1` — perturbations en cours d'une ligne (sans ligne : tes lignes abonnées)\n"
     "/lines — lignes actuellement perturbées (avec boutons)\n"
     "/sub — voir tes abonnements\n"
@@ -990,7 +1106,11 @@ HELP_TEXT = (
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await tg_send(context.bot, update.effective_chat.id, HELP_TEXT)
+    await tg_send(context.bot, update.effective_chat.id, HELP_TEXT, _main_markup())
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await tg_send(context.bot, update.effective_chat.id, MENU_TEXT, _main_markup())
 
 
 async def send_traffic(context, chat_id: int, lignes: set[str], single: str | None = None):
@@ -1105,15 +1225,18 @@ async def cmd_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    await send_lines(context.bot, update.effective_chat.id)
+
+
+async def send_lines(bot, chat_id: int) -> None:
     try:
         disruptions = await fetch_disruptions()
     except Exception as error:
-        await tg_send(context.bot, chat_id, f"Erreur lors de la récupération des infos trafic : {error}")
+        await tg_send(bot, chat_id, f"Erreur lors de la récupération des infos trafic : {error}")
         return
 
     if not disruptions:
-        await tg_send(context.bot, chat_id, "Aucune perturbation en cours sur le réseau ✅")
+        await tg_send(bot, chat_id, "Aucune perturbation en cours sur le réseau ✅")
         return
 
     perturbees = {d["ligne"] for d in disruptions}
@@ -1130,28 +1253,174 @@ async def cmd_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cliquables = [l for l in sorted(perturbees, key=_line_sort_key) if not VALID_LINES or l in VALID_LINES]
     boutons = [InlineKeyboardButton(l, callback_data=f"t:{l}") for l in cliquables[:90]]
     rows = [boutons[i:i + 5] for i in range(0, len(boutons), 5)]
-    await tg_send(context.bot, chat_id, "\n".join(parts), InlineKeyboardMarkup(rows) if rows else None)
+    await tg_send(bot, chat_id, "\n".join(parts), InlineKeyboardMarkup(rows) if rows else None)
+
+
+# ---------- Menu à boutons ----------
+
+MENU_TEXT = "🚇 **TCL Info Trafic**\nQue veux-tu faire ?"
+CAT_EMOJI = {
+    "Métro": "🚇", "Funiculaire": "🚡", "Tram": "🚊", "TramBus": "🚎", "Ligne Chrono": "⚡",
+    "Pleine Lune": "🌙", "Navette": "⛴️", "Rhônexpress": "✈️", "Autres lignes": "🚌",
+    "Bus relais": "🔁", "Lignes JD": "🎒",
+}
+PAGE_SIZE = 24
+_cat_lines_cache: dict[str, list[str]] | None = None
+
+
+def _cat_lines() -> dict[str, list[str]]:
+    """Lignes valides regroupées par type, dans l'ordre d'affichage."""
+    global _cat_lines_cache
+    if _cat_lines_cache is None:
+        grouped: dict[str, list[str]] = {cat: [] for cat in _CATEGORY_ORDER}
+        for ligne in VALID_LINES:
+            grouped[_line_category(ligne)].append(ligne)
+        _cat_lines_cache = {cat: sorted(v, key=_line_sort_key) for cat, v in grouped.items()}
+    return _cat_lines_cache
+
+
+def _btn(label: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(label, callback_data=data)
+
+
+def _rows(buttons: list, per_row: int) -> list[list]:
+    return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
+
+
+def _main_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_btn("🚦 Mes lignes", "m:traffic"), _btn("🔔 Mes abonnements", "m:mine")],
+        [_btn("📋 Lignes perturbées", "m:lines"), _btn("➕ Ajouter des lignes", "m:add")],
+    ])
+
+
+def screen_main():
+    return MENU_TEXT, _main_markup()
+
+
+def screen_mine(chat_id: int):
+    subs = get_subs(chat_id)
+    nav = [_btn("➕ Ajouter", "m:add"), _btn("🏠 Menu", "m:main")]
+    if not subs:
+        return "🔔 **Tes abonnements**\nAucune ligne pour l'instant.", InlineKeyboardMarkup([nav])
+    boutons = [_btn(f"❌ {l}", f"r:{l}") for l in subs[:90]]
+    return (
+        "🔔 **Tes abonnements**\nAppuie sur une ligne pour te désabonner.",
+        InlineKeyboardMarkup(_rows(boutons, 4) + [nav]),
+    )
+
+
+def screen_categories(chat_id: int):
+    if not VALID_LINES:
+        return "Liste des lignes indisponible.", InlineKeyboardMarkup([[_btn("🏠 Menu", "m:main")]])
+    subs = set(get_subs(chat_id))
+    boutons = []
+    for i, cat in enumerate(_CATEGORY_ORDER):
+        lignes = _cat_lines()[cat]
+        if not lignes:
+            continue
+        mine = sum(1 for l in lignes if l in subs)
+        compteur = f"{mine}/{len(lignes)}" if mine else f"{len(lignes)}"
+        boutons.append(_btn(f"{CAT_EMOJI.get(cat, '🚌')} {cat} ({compteur})", f"c:{i}:0"))
+    return (
+        "➕ **Ajouter des lignes**\nChoisis un type de ligne.",
+        InlineKeyboardMarkup(_rows(boutons, 2) + [[_btn("🏠 Menu", "m:main")]]),
+    )
+
+
+def screen_category(chat_id: int, i: int, page: int):
+    cat = _CATEGORY_ORDER[i]
+    lignes = _cat_lines()[cat]
+    pages = max(1, -(-len(lignes) // PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    subs = set(get_subs(chat_id))
+    morceau = lignes[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    boutons = [_btn(("✅ " if l in subs else "") + l, f"x:{l}:{i}:{page}") for l in morceau]
+    rows = _rows(boutons, 4)
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(_btn("◀️", f"c:{i}:{page - 1}"))
+        nav.append(_btn(f"{page + 1}/{pages}", f"c:{i}:{page}"))
+        if page < pages - 1:
+            nav.append(_btn("▶️", f"c:{i}:{page + 1}"))
+        rows.append(nav)
+    rows.append([_btn("⬅️ Types", "m:add"), _btn("🏠 Menu", "m:main")])
+    titre = f"{CAT_EMOJI.get(cat, '🚌')} **{cat}**" + (f" — page {page + 1}/{pages}" if pages > 1 else "")
+    return titre + "\nAppuie sur une ligne pour t'abonner / te désabonner (✅ = abonné).", InlineKeyboardMarkup(rows)
+
+
+async def _edit_screen(query, screen) -> None:
+    text, markup = screen
+    try:
+        await query.edit_message_text(
+            to_html(text), parse_mode=ParseMode.HTML, reply_markup=markup, link_preview_options=_NO_PREVIEW,
+        )
+    except BadRequest as error:
+        if "not modified" not in str(error).lower():
+            log.warning("Édition de menu échouée : %s", error)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action, _, ligne = (query.data or "").partition(":")
+    parts = (query.data or "").split(":")
+    action = parts[0]
     chat_id = query.message.chat_id
 
-    if VALID_LINES and ligne not in VALID_LINES:
-        return
+    def connue(ligne: str) -> bool:
+        return not VALID_LINES or ligne in VALID_LINES
 
-    if action == "t":
-        await send_traffic(context, chat_id, {ligne}, single=ligne)
-    elif action in ("sub", "unsub"):
-        courant = set(get_subs(chat_id))
-        courant.add(ligne) if action == "sub" else courant.discard(ligne)
-        set_subs(chat_id, list(courant))
-        try:
-            await query.edit_message_reply_markup(sub_button(chat_id, ligne))
-        except BadRequest:
-            pass  # message identique / trop ancien : sans importance
+    try:
+        if action == "m":
+            what = parts[1]
+            if what == "main":
+                await _edit_screen(query, screen_main())
+            elif what == "mine":
+                await _edit_screen(query, screen_mine(chat_id))
+            elif what == "add":
+                await _edit_screen(query, screen_categories(chat_id))
+            elif what == "traffic":
+                subs = get_subs(chat_id)
+                if subs:
+                    await send_traffic(context, chat_id, set(subs))
+                else:
+                    await _edit_screen(query, screen_mine(chat_id))
+            elif what == "lines":
+                await send_lines(context.bot, chat_id)
+
+        elif action == "c":
+            i, page = int(parts[1]), int(parts[2])
+            if 0 <= i < len(_CATEGORY_ORDER):
+                await _edit_screen(query, screen_category(chat_id, i, page))
+
+        elif action == "x":  # (dés)abonnement depuis une page de catégorie
+            ligne, i, page = parts[1], int(parts[2]), int(parts[3])
+            if connue(ligne) and 0 <= i < len(_CATEGORY_ORDER):
+                courant = set(get_subs(chat_id))
+                courant.symmetric_difference_update({ligne})
+                set_subs(chat_id, list(courant))
+                await _edit_screen(query, screen_category(chat_id, i, page))
+
+        elif action == "r":  # désabonnement depuis « Mes abonnements »
+            courant = set(get_subs(chat_id))
+            courant.discard(parts[1])
+            set_subs(chat_id, list(courant))
+            await _edit_screen(query, screen_mine(chat_id))
+
+        elif action == "t" and connue(parts[1]):
+            await send_traffic(context, chat_id, {parts[1]}, single=parts[1])
+
+        elif action in ("sub", "unsub") and connue(parts[1]):
+            courant = set(get_subs(chat_id))
+            courant.add(parts[1]) if action == "sub" else courant.discard(parts[1])
+            set_subs(chat_id, list(courant))
+            try:
+                await query.edit_message_reply_markup(sub_button(chat_id, parts[1]))
+            except BadRequest:
+                pass  # message identique / trop ancien : sans importance
+    except (IndexError, ValueError):
+        return  # bouton d'un ancien format : on ignore
 
 
 # ---------- Alertes automatiques ----------
@@ -1247,6 +1516,7 @@ async def on_ready():
 tg_app: Application | None = None
 
 TG_COMMANDS = [
+    BotCommand("menu", "Menu à boutons"),
     BotCommand("traffic", "Perturbations d'une ligne (ex: /traffic C1)"),
     BotCommand("lines", "Lignes actuellement perturbées"),
     BotCommand("sub", "Gérer tes abonnements (add / rmv)"),
@@ -1260,6 +1530,7 @@ def build_tg_app() -> Application:
     app.add_handler(CommandHandler("traffic", cmd_traffic))
     app.add_handler(CommandHandler("sub", cmd_sub))
     app.add_handler(CommandHandler("lines", cmd_lines))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(on_button))
     return app
 
@@ -1283,6 +1554,8 @@ async def main_async() -> None:
             tg_app = build_tg_app()
             await tg_app.initialize()
             await tg_app.bot.set_my_commands(TG_COMMANDS)
+            await tg_pull_subs(tg_app.bot)
+            tg_app.bot_data["storage_task"] = asyncio.create_task(tg_storage_worker(tg_app.bot))
             await tg_initialize_baseline()
             await tg_app.start()
             await tg_app.updater.start_polling()
